@@ -413,6 +413,7 @@ class Hy3DRenderMultiViewDepth:
 
         return depth_maps
     
+
 class Hy3DSampleMultiView:
     @classmethod
     def INPUT_TYPES(s):
@@ -420,9 +421,12 @@ class Hy3DSampleMultiView:
             "required": {
                 "pipeline": ("HY3DPAINTMODEL",),
                 "ref_image": ("IMAGE", ),
+                "prompt": ("STRING", {"default": "", "multiline": False}),
+                "negative_prompt": ("STRING", {"default": "watermark, ugly, deformed, noisy, blurry, low contrast", "multiline": False}),
                 "normal_maps": ("IMAGE", ),
                 "position_maps": ("IMAGE", ),
                 "view_size": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 16}),
+                "guidance_scale" : ("FLOAT", {"default": 2.0, "min": 0.0, "max": 100.0, "step": 0.01}),
                 "steps": ("INT", {"default": 30, "min": 1}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
             },
@@ -436,7 +440,7 @@ class Hy3DSampleMultiView:
     FUNCTION = "process"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def process(self, pipeline, ref_image, normal_maps, position_maps, view_size, seed, steps, camera_config=None):
+    def process(self, pipeline, prompt, negative_prompt, ref_image, normal_maps, position_maps, view_size, guidance_scale, seed, steps, camera_config=None):
         device = mm.get_torch_device()
         mm.soft_empty_cache()
         torch.manual_seed(seed)
@@ -477,8 +481,13 @@ class Hy3DSampleMultiView:
 
         callback = ComfyProgressCallback(total_steps=steps)
 
+        print("Pre pipeline")
+
         multiview_images = pipeline(
             input_image,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale,
             width=view_size,
             height=view_size,
             generator=generator,
