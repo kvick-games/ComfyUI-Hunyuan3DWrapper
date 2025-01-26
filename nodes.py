@@ -1,5 +1,6 @@
 import os
 import torch
+import torchvision.transforms as transforms
 from PIL import Image
 from pathlib import Path
 import numpy as np
@@ -14,7 +15,7 @@ from comfy.utils import load_torch_file, ProgressBar
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
-from .utils import log, print_memory, pil_list_to_torch_batch
+from .utils import log, print_memory
 
 class ComfyProgressCallback:
     def __init__(self, total_steps):
@@ -72,28 +73,31 @@ class Hy3DModelLoader:
             },
             "optional": {
                 "compile_args": ("HY3DCOMPILEARGS", {"tooltip": "torch.compile settings, when connected to the model loader, torch.compile of the selected models is attempted. Requires Triton and torch 2.5.0 is recommended"}),
+                "attention_mode": (["sdpa", "sageattn"], {"default": "sdpa"}),
             }
         }
 
-    RETURN_TYPES = ("HY3DMODEL",)
-    RETURN_NAMES = ("pipeline", )
+    RETURN_TYPES = ("HY3DMODEL", "HY3DVAE")
+    RETURN_NAMES = ("pipeline", "vae")
     FUNCTION = "loadmodel"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def loadmodel(self, model, compile_args=None):
+    def loadmodel(self, model, compile_args=None, attention_mode="sdpa"):
         device = mm.get_torch_device()
         offload_device=mm.unet_offload_device()
 
         config_path = os.path.join(script_directory, "configs", "dit_config.yaml")
         model_path = folder_paths.get_full_path("diffusion_models", model)
-        pipe = Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
+        pipe, vae = Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
             ckpt_path=model_path, 
             config_path=config_path, 
             use_safetensors=True, 
             device=device, 
             offload_device=offload_device,
-            compile_args=compile_args)
-        return (pipe,)
+            compile_args=compile_args,
+            attention_mode=attention_mode)
+        
+        return (pipe, vae,)
 
 class DownloadAndLoadHy3DDelightModel:
     @classmethod
@@ -138,28 +142,6 @@ class DownloadAndLoadHy3DDelightModel:
         delight_pipe.enable_model_cpu_offload()
         
         return (delight_pipe,)
-
-class Hy3DLoadMesh:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "glb_path": ("STRING", {"default": "", "tooltip": "The glb path with mesh to load."}), 
-            }
-        }
-    RETURN_TYPES = ("HY3DMESH",)
-    RETURN_NAMES = ("mesh",)
-    OUTPUT_TOOLTIPS = ("The glb model with mesh to texturize.",)
-    
-    FUNCTION = "load"
-    CATEGORY = "Hunyuan3DWrapper"
-    DESCRIPTION = "Loads a glb model from the given path."
-
-    def load(self, glb_path):
-        
-        mesh = trimesh.load(glb_path, force="mesh")
-        
-        return (mesh,)
         
 class Hy3DDelightImage:
     @classmethod
@@ -249,6 +231,7 @@ class DownloadAndLoadHy3DPaintModel:
         pipeline.enable_model_cpu_offload()
         return (pipeline,)
 
+#region Texture
 class Hy3DCameraConfig:
     @classmethod
     def INPUT_TYPES(s):
@@ -257,6 +240,8 @@ class Hy3DCameraConfig:
                 "camera_azimuths": ("STRING", {"default": "0, 90, 180, 270, 0, 180", "multiline": False}),
                 "camera_elevations": ("STRING", {"default": "0, 0, 0, 0, 90, -90", "multiline": False}),
                 "view_weights": ("STRING", {"default": "1, 0.1, 0.5, 0.1, 0.05, 0.05", "multiline": False}),
+                "camera_distance": ("FLOAT", {"default": 1.45, "min": 0.1, "max": 10.0, "step": 0.001}),
+                "ortho_scale": ("FLOAT", {"default": 1.2, "min": 0.1, "max": 10.0, "step": 0.001}),
             },
         }
 
@@ -265,7 +250,7 @@ class Hy3DCameraConfig:
     FUNCTION = "process"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def process(self, camera_azimuths, camera_elevations, view_weights):
+    def process(self, camera_azimuths, camera_elevations, view_weights, camera_distance, ortho_scale):
         angles_list = list(map(int, camera_azimuths.replace(" ", "").split(',')))
         elevations_list = list(map(int, camera_elevations.replace(" ", "").split(',')))
         weights_list = list(map(float, view_weights.replace(" ", "").split(',')))
@@ -273,7 +258,9 @@ class Hy3DCameraConfig:
         camera_config = {
             "selected_camera_azims": angles_list,
             "selected_camera_elevs": elevations_list,
-            "selected_view_weights": weights_list
+            "selected_view_weights": weights_list,
+            "camera_distance": camera_distance,
+            "ortho_scale": ortho_scale,
             }
         
         return (camera_config,)
@@ -321,18 +308,24 @@ class Hy3DRenderMultiView:
 
         from .hy3dgen.texgen.differentiable_renderer.mesh_render import MeshRender
 
-        self.render = MeshRender(
-            default_resolution=render_size,
-            texture_size=texture_size)
-
-        self.render.load_mesh(mesh)
-
         if camera_config is None:
             selected_camera_azims = [0, 90, 180, 270, 0, 180]
             selected_camera_elevs = [0, 0, 0, 0, 90, -90]
+            camera_distance = 1.45
+            ortho_scale = 1.2
         else:
             selected_camera_azims = camera_config["selected_camera_azims"]
             selected_camera_elevs = camera_config["selected_camera_elevs"]
+            camera_distance = camera_config["camera_distance"]
+            ortho_scale = camera_config["ortho_scale"]
+        
+        self.render = MeshRender(
+            default_resolution=render_size,
+            texture_size=texture_size,
+            camera_distance=camera_distance,
+            ortho_scale=ortho_scale)
+
+        self.render.load_mesh(mesh)
 
         normal_maps = self.render_normal_multiview(
             selected_camera_elevs, selected_camera_azims, use_abs_coor=True)
@@ -385,18 +378,26 @@ class Hy3DRenderMultiViewDepth:
 
         from .hy3dgen.texgen.differentiable_renderer.mesh_render import MeshRender
 
-        self.render = MeshRender(
-            default_resolution=render_size,
-            texture_size=texture_size)
-
-        self.render.load_mesh(mesh)
-
         if camera_config is None:
             selected_camera_azims = [0, 90, 180, 270, 0, 180]
             selected_camera_elevs = [0, 0, 0, 0, 90, -90]
+            camera_distance = 1.45
+            ortho_scale = 1.2
         else:
             selected_camera_azims = camera_config["selected_camera_azims"]
             selected_camera_elevs = camera_config["selected_camera_elevs"]
+            camera_distance = camera_config["camera_distance"]
+            ortho_scale = camera_config["ortho_scale"]
+
+        self.render = MeshRender(
+            default_resolution=render_size,
+            texture_size=texture_size,
+            camera_distance=camera_distance,
+            ortho_scale=ortho_scale)
+
+        self.render.load_mesh(mesh)
+
+       
 
         depth_maps = self.render_depth_multiview(
             selected_camera_elevs, selected_camera_azims)
@@ -670,7 +671,31 @@ class Hy3DApplyTexture:
         textured_mesh = self.render.save_mesh()
         
         return (textured_mesh,)
+
+#region Mesh
+
+class Hy3DLoadMesh:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "glb_path": ("STRING", {"default": "", "tooltip": "The glb path with mesh to load."}), 
+            }
+        }
+    RETURN_TYPES = ("HY3DMESH",)
+    RETURN_NAMES = ("mesh",)
+    OUTPUT_TOOLTIPS = ("The glb model with mesh to texturize.",)
     
+    FUNCTION = "load"
+    CATEGORY = "Hunyuan3DWrapper"
+    DESCRIPTION = "Loads a glb model from the given path."
+
+    def load(self, glb_path):
+        
+        mesh = trimesh.load(glb_path, force="mesh")
+        
+        return (mesh,)
+
 class Hy3DGenerateMesh:
     @classmethod
     def INPUT_TYPES(s):
@@ -678,7 +703,6 @@ class Hy3DGenerateMesh:
             "required": {
                 "pipeline": ("HY3DMODEL",),
                 "image": ("IMAGE", ),
-                "octree_resolution": ("INT", {"default": 256, "min": 64, "max": 4096, "step": 16}),
                 "guidance_scale": ("FLOAT", {"default": 5.5, "min": 0.0, "max": 100.0, "step": 0.01}),
                 "steps": ("INT", {"default": 30, "min": 1}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
@@ -688,12 +712,12 @@ class Hy3DGenerateMesh:
             }
         }
 
-    RETURN_TYPES = ("HY3DMESH",)
-    RETURN_NAMES = ("mesh",)
+    RETURN_TYPES = ("HY3DLATENT",)
+    RETURN_NAMES = ("latents",)
     FUNCTION = "process"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def process(self, pipeline, image, steps, guidance_scale, octree_resolution, seed, mask=None):
+    def process(self, pipeline, image, steps, guidance_scale, seed, mask=None):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -711,16 +735,12 @@ class Hy3DGenerateMesh:
         except:
             pass
 
-        mesh = pipeline(
+        latents = pipeline(
             image=image, 
             mask=mask,
             num_inference_steps=steps, 
-            mc_algo='mc',
             guidance_scale=guidance_scale,
-            octree_resolution=octree_resolution,
-            generator=torch.manual_seed(seed))[0]
-        
-        log.info(f"Generated mesh with {mesh.vertices.shape[0]} vertices and {mesh.faces.shape[0]} faces")
+            generator=torch.manual_seed(seed))
 
         print_memory(device)
         try:
@@ -730,7 +750,51 @@ class Hy3DGenerateMesh:
 
         pipeline.to(offload_device)
         
-        return (mesh, )
+        return (latents, )
+    
+class Hy3DVAEDecode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "vae": ("HY3DVAE",),
+                "latents": ("HY3DLATENT", ),
+                "box_v": ("FLOAT", {"default": 1.01, "min": -10.0, "max": 10.0, "step": 0.001}),
+                "octree_resolution": ("INT", {"default": 384, "min": 64, "max": 4096, "step": 16}),
+                "num_chunks": ("INT", {"default": 8000, "min": 1, "max": 10000000, "step": 1}),
+                "mc_level": ("FLOAT", {"default": 0, "min": -1.0, "max": 1.0, "step": 0.0001}),
+                "mc_algo": (["mc", "dmc"], {"default": "mc"}),
+            },
+        }
+
+    RETURN_TYPES = ("HY3DMESH",)
+    RETURN_NAMES = ("mesh",)
+    FUNCTION = "process"
+    CATEGORY = "Hunyuan3DWrapper"
+
+    def process(self, vae, latents, box_v, octree_resolution, mc_level, num_chunks, mc_algo):
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+
+        vae.to(device)
+        latents = 1. / vae.scale_factor * latents
+        latents = vae(latents)
+        
+        outputs = vae.latents2mesh(
+            latents,
+            bounds=box_v,
+            mc_level=mc_level,
+            num_chunks=num_chunks,
+            octree_resolution=octree_resolution,
+            mc_algo=mc_algo,
+        )[0]
+        vae.to(offload_device)
+
+        outputs.mesh_f = outputs.mesh_f[:, ::-1]
+        mesh_output = trimesh.Trimesh(outputs.mesh_v, outputs.mesh_f)
+        log.info(f"Decoded mesh with {mesh_output.vertices.shape[0]} vertices and {mesh_output.faces.shape[0]} faces")
+        
+        return (mesh_output, )
     
 class Hy3DPostprocessMesh:
     @classmethod
@@ -742,6 +806,7 @@ class Hy3DPostprocessMesh:
                 "remove_degenerate_faces": ("BOOLEAN", {"default": True}),
                 "reduce_faces": ("BOOLEAN", {"default": True}),
                 "max_facenum": ("INT", {"default": 40000, "min": 1, "max": 10000000, "step": 1}),
+                "smooth_normals": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -750,18 +815,128 @@ class Hy3DPostprocessMesh:
     FUNCTION = "process"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def process(self, mesh, remove_floaters, remove_degenerate_faces, reduce_faces, max_facenum):
+    def process(self, mesh, remove_floaters, remove_degenerate_faces, reduce_faces, max_facenum, smooth_normals):
+        new_mesh = mesh.copy()
         if remove_floaters:
-            mesh = FloaterRemover()(mesh)
-            log.info(f"Removed floaters, resulting in {mesh.vertices.shape[0]} vertices and {mesh.faces.shape[0]} faces")
+            new_mesh = FloaterRemover()(new_mesh)
+            log.info(f"Removed floaters, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")
         if remove_degenerate_faces:
-            mesh = DegenerateFaceRemover()(mesh)
-            log.info(f"Removed degenerate faces, resulting in {mesh.vertices.shape[0]} vertices and {mesh.faces.shape[0]} faces")
+            new_mesh = DegenerateFaceRemover()(new_mesh)
+            log.info(f"Removed degenerate faces, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")
         if reduce_faces:
-            mesh = FaceReducer()(mesh, max_facenum=max_facenum)
-            log.info(f"Reduced faces, resulting in {mesh.vertices.shape[0]} vertices and {mesh.faces.shape[0]} faces")
+            new_mesh = FaceReducer()(new_mesh, max_facenum=max_facenum)
+            log.info(f"Reduced faces, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")
+        if smooth_normals:              
+            new_mesh.vertex_normals = trimesh.smoothing.get_vertices_normals(new_mesh)
+
         
-        return (mesh, )
+        return (new_mesh, )
+    
+class Hy3DGetMeshPBRTextures:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh": ("HY3DMESH",),
+                "texture" : (["base_color", "emissive", "metallic_roughness", "normal", "occlusion"], ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", )
+    RETURN_NAMES = ("image",)
+    FUNCTION = "get_textures"
+    CATEGORY = "Hunyuan3DWrapper"
+
+    def get_textures(self, mesh, texture):
+        
+        TEXTURE_MAPPING = {
+            'base_color': ('baseColorTexture', "Base color"),
+            'emissive': ('emissiveTexture', "Emissive"),
+            'metallic_roughness': ('metallicRoughnessTexture', "Metallic roughness"),
+            'normal': ('normalTexture', "Normal"),
+            'occlusion': ('occlusionTexture', "Occlusion"),
+        }
+        
+        texture_attr, texture_name = TEXTURE_MAPPING[texture]
+        texture_data = getattr(mesh.visual.material, texture_attr)
+        
+        if texture_data is None:
+            raise ValueError(f"{texture_name} texture not found")
+            
+        to_tensor = transforms.ToTensor()
+        return (to_tensor(texture_data).unsqueeze(0).permute(0, 2, 3, 1).cpu().float(),)
+    
+class Hy3DSetMeshPBRTextures:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh": ("HY3DMESH",),
+                "image": ("IMAGE", ),
+                "texture" : (["base_color", "emissive", "metallic_roughness", "normal", "occlusion"], ),
+            },
+        }
+
+    RETURN_TYPES = ("HY3DMESH", )
+    RETURN_NAMES = ("mesh",)
+    FUNCTION = "set_textures"
+    CATEGORY = "Hunyuan3DWrapper"
+
+    def set_textures(self, mesh, image, texture):
+        from trimesh.visual.material import SimpleMaterial
+        if isinstance(mesh.visual.material, SimpleMaterial):
+            log.info("Found SimpleMaterial, Converting to PBRMaterial")
+            mesh.visual.material = mesh.visual.material.to_pbr()
+
+        
+        TEXTURE_MAPPING = {
+            'base_color': ('baseColorTexture', "Base color"),
+            'emissive': ('emissiveTexture', "Emissive"),
+            'metallic_roughness': ('metallicRoughnessTexture', "Metallic roughness"),
+            'normal': ('normalTexture', "Normal"),
+            'occlusion': ('occlusionTexture', "Occlusion"),
+        }
+        new_mesh = mesh.copy()
+        texture_attr, texture_name = TEXTURE_MAPPING[texture]
+        image_np = (image[0].cpu().numpy() * 255).astype(np.uint8)
+        if image_np.shape[2] == 4:  # RGBA
+            pil_image = Image.fromarray(image_np, 'RGBA')
+        else:  # RGB
+            pil_image = Image.fromarray(image_np, 'RGB')
+            
+        setattr(new_mesh.visual.material, texture_attr, pil_image)
+            
+        return (new_mesh,)
+
+class Hy3DSetMeshPBRAttributes:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh": ("HY3DMESH",),
+                "baseColorFactor": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "emissiveFactor": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "metallicFactor": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "roughnessFactor": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "doubleSided": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("HY3DMESH", )
+    RETURN_NAMES = ("mesh",)
+    FUNCTION = "set_textures"
+    CATEGORY = "Hunyuan3DWrapper"
+
+    def set_textures(self, mesh, baseColorFactor, emissiveFactor, metallicFactor, roughnessFactor, doubleSided):
+        
+        new_mesh = mesh.copy()
+        new_mesh.visual.material.baseColorFactor = [baseColorFactor, baseColorFactor, baseColorFactor, 1.0]
+        new_mesh.visual.material.emissiveFactor = [emissiveFactor, emissiveFactor, emissiveFactor]
+        new_mesh.visual.material.metallicFactor = metallicFactor        
+        new_mesh.visual.material.roughnessFactor = roughnessFactor
+        new_mesh.visual.material.doubleSided = doubleSided
+            
+        return (new_mesh,)
     
 class Hy3DExportMesh:
     @classmethod
@@ -807,6 +982,10 @@ NODE_CLASS_MAPPINGS = {
     "Hy3DApplyTexture": Hy3DApplyTexture,
     "CV2InpaintTexture": CV2InpaintTexture,
     "Hy3DRenderMultiViewDepth": Hy3DRenderMultiViewDepth,
+    "Hy3DGetMeshPBRTextures": Hy3DGetMeshPBRTextures,
+    "Hy3DSetMeshPBRTextures": Hy3DSetMeshPBRTextures,
+    "Hy3DSetMeshPBRAttributes": Hy3DSetMeshPBRAttributes,
+    "Hy3DVAEDecode": Hy3DVAEDecode
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DModelLoader": "Hy3DModelLoader",
@@ -827,4 +1006,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DApplyTexture": "Hy3D Apply Texture",
     "CV2InpaintTexture": "CV2 Inpaint Texture",
     "Hy3DRenderMultiViewDepth": "Hy3D Render MultiView Depth",
+    "Hy3DGetMeshPBRTextures": "Hy3D Get Mesh PBR Textures",
+    "Hy3DSetMeshPBRTextures": "Hy3D Set Mesh PBR Textures",
+    "Hy3DSetMeshPBRAttributes": "Hy3D Set Mesh PBR Attributes",
+    "Hy3DVAEDecode": "Hy3D VAE Decode"
     }
