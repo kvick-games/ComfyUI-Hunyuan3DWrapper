@@ -378,6 +378,7 @@ class Hy3DRenderMultiView:
             },
             "optional": {
                 "camera_config": ("HY3DCAMERA",),
+                "normal_space": (["world", "tangent"], {"default": "world"}),
             }
         }
 
@@ -386,7 +387,7 @@ class Hy3DRenderMultiView:
     FUNCTION = "process"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def process(self, mesh, render_size, texture_size, camera_config=None):
+    def process(self, mesh, render_size, texture_size, camera_config=None, normal_space="world"):
 
         from .hy3dgen.texgen.differentiable_renderer.mesh_render import MeshRender
 
@@ -409,9 +410,22 @@ class Hy3DRenderMultiView:
 
         self.render.load_mesh(mesh)
 
-        normal_maps = self.render_normal_multiview(
-            selected_camera_elevs, selected_camera_azims, use_abs_coor=True)
-        normal_tensors = torch.stack(normal_maps, dim=0)
+        if normal_space == "world":
+            normal_maps = self.render_normal_multiview(
+                selected_camera_elevs, selected_camera_azims, use_abs_coor=True)
+            normal_tensors = torch.stack(normal_maps, dim=0)
+        elif normal_space == "tangent":
+            normal_maps = self.render_normal_multiview(
+                selected_camera_elevs, selected_camera_azims, bg_color=[0, 0, 0], use_abs_coor=False)
+            normal_tensors = torch.stack(normal_maps, dim=0)
+            normal_tensors = 2.0 * normal_tensors - 1.0  # Map [0,1] to [-1,1]
+            normal_tensors = normal_tensors / (torch.norm(normal_tensors, dim=-1, keepdim=True) + 1e-6)
+            # Remap axes for standard normal map convention
+            image = torch.zeros_like(normal_tensors)
+            image[..., 0] = normal_tensors[..., 0]  # View right to R
+            image[..., 1] = normal_tensors[..., 1]  # View up to G
+            image[..., 2] = -normal_tensors[..., 2] # View forward (negated) to B
+            normal_tensors = (image + 1) * 0.5
         
         position_maps = self.render_position_multiview(
             selected_camera_elevs, selected_camera_azims)
@@ -419,11 +433,11 @@ class Hy3DRenderMultiView:
         
         return (normal_tensors, position_tensors, self.render,)
     
-    def render_normal_multiview(self, camera_elevs, camera_azims, use_abs_coor=True):
+    def render_normal_multiview(self, camera_elevs, camera_azims, use_abs_coor=True, bg_color=[1, 1, 1]):
         normal_maps = []
         for elev, azim in zip(camera_elevs, camera_azims):
             normal_map, _ = self.render.render_normal(
-                elev, azim, use_abs_coor=use_abs_coor, return_type='th')
+                elev, azim, bg_color=bg_color, use_abs_coor=use_abs_coor, return_type='th')
             normal_maps.append(normal_map)
 
         return normal_maps
@@ -1067,6 +1081,74 @@ class Hy3DPostprocessMesh:
 
         
         return (new_mesh, )
+
+class Hy3DFastSimplifyMesh:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh": ("HY3DMESH",),
+                "target_count": ("INT", {"default": 40000, "min": 1, "max": 100000000, "step": 1, "tooltip": "Target number of triangles"}),
+                "aggressiveness": ("INT", {"default": 7, "min": 0, "max": 100, "step": 1, "tooltip": "Parameter controlling the growth rate of the threshold at each iteration when lossless is False."}),
+                "max_iterations": ("INT", {"default": 100, "min": 1, "max": 1000, "step": 1, "tooltip": "Maximal number of iterations"}),
+                "update_rate": ("INT", {"default": 5, "min": 1, "max": 1000, "step": 1, "tooltip": "Number of iterations between each update"}),
+                "preserve_border": ("BOOLEAN", {"default": True, "tooltip": "Flag for preserving the vertices situated on open borders."}),
+                "lossless": ("BOOLEAN", {"default": False, "tooltip": "Flag for using the lossless simplification method. Sets the update rate to 1"}),
+                "threshold_lossless": ("FLOAT", {"default": 1e-3, "min": 0.0, "max": 1.0, "step": 0.0001, "tooltip": "Threshold for the lossless simplification method."}),
+            },
+        }
+
+    RETURN_TYPES = ("HY3DMESH",)
+    RETURN_NAMES = ("mesh",)
+    FUNCTION = "process"
+    CATEGORY = "Hunyuan3DWrapper"
+    DESCRIPTION = "Simplifies the mesh using Fast Quadric Mesh Reduction: https://github.com/Kramer84/pyfqmr-Fast-Quadric-Mesh-Reduction"
+
+    def process(self, mesh, target_count, aggressiveness, preserve_border, max_iterations,lossless, threshold_lossless, update_rate):
+        new_mesh = mesh.copy()
+        try:
+            import pyfqmr
+        except ImportError:
+            raise ImportError("pyfqmr not found. Please install it using 'pip install pyfqmr' https://github.com/Kramer84/pyfqmr-Fast-Quadric-Mesh-Reduction")
+        
+        mesh_simplifier = pyfqmr.Simplify()
+        mesh_simplifier.setMesh(mesh.vertices, mesh.faces)
+        mesh_simplifier.simplify_mesh(
+            target_count=target_count, 
+            aggressiveness=aggressiveness,
+            update_rate=update_rate,
+            max_iterations=max_iterations,
+            preserve_border=preserve_border, 
+            verbose=True,
+            lossless=lossless
+            )
+        new_mesh.vertices, new_mesh.faces, _ = mesh_simplifier.getMesh()
+        log.info(f"Simplified mesh to {target_count} vertices, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")   
+        
+        return (new_mesh, )
+    
+class Hy3DMeshInfo:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh": ("HY3DMESH",),
+            },
+        }
+
+    RETURN_TYPES = ("HY3DMESH", "INT", "INT", )
+    RETURN_NAMES = ("mesh", "vertices", "faces",)
+    FUNCTION = "process"
+    CATEGORY = "Hunyuan3DWrapper"
+
+    def process(self, mesh):
+        vertices_count = mesh.vertices.shape[0]
+        faces_count = mesh.faces.shape[0]
+        log.info(f"Hy3DMeshInfo: Mesh has {vertices_count} vertices and {mesh.faces.shape[0]} faces")
+        return {"ui": {
+            "text": [f"{vertices_count:,.0f}x{faces_count:,.0f}"]}, 
+            "result": (mesh, vertices_count, faces_count) 
+        }
     
 class Hy3DIMRemesh:
     @classmethod
@@ -1303,8 +1385,9 @@ NODE_CLASS_MAPPINGS = {
     "Hy3DRenderSingleView": Hy3DRenderSingleView,
     "Hy3DDiffusersSchedulerConfig": Hy3DDiffusersSchedulerConfig,
     "Hy3DIMRemesh": Hy3DIMRemesh,
-    "Hy3DModelStats": Hy3DModelStats
-}
+    "Hy3DMeshInfo": Hy3DMeshInfo,
+    "Hy3DFastSimplifyMesh": Hy3DFastSimplifyMesh
+    }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DModelLoader": "Hy3DModelLoader",
     "Hy3DGenerateMesh": "Hy3DGenerateMesh",
@@ -1331,5 +1414,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DRenderSingleView": "Hy3D Render SingleView",
     "Hy3DDiffusersSchedulerConfig": "Hy3D Diffusers Scheduler Config",
     "Hy3DIMRemesh": "Hy3D Instant-Meshes Remesh",
-    "Hy3DModelStats": "Hy3D Model Stats"
-}
+    "Hy3DMeshInfo": "Hy3D Mesh Info",
+    "Hy3DFastSimplifyMesh": "Hy3D Fast Simplify Mesh"
+    }
