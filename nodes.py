@@ -4,9 +4,45 @@ import torchvision.transforms as transforms
 from PIL import Image
 from pathlib import Path
 import numpy as np
+import json
 import trimesh
 
 from .hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline, FaceReducer, FloaterRemover, DegenerateFaceRemover
+from .hy3dgen.texgen.hunyuanpaint.unet.modules import UNet2DConditionModel, UNet2p5DConditionModel
+from .hy3dgen.texgen.hunyuanpaint.pipeline import HunyuanPaintPipeline
+
+from diffusers import AutoencoderKL
+from diffusers.schedulers import (
+    DDIMScheduler, 
+    PNDMScheduler, 
+    DPMSolverMultistepScheduler, 
+    EulerDiscreteScheduler, 
+    EulerAncestralDiscreteScheduler,
+    UniPCMultistepScheduler,
+    HeunDiscreteScheduler,
+    SASolverScheduler,
+    DEISMultistepScheduler,
+    LCMScheduler
+    )
+
+scheduler_mapping = {
+    "DPM++": DPMSolverMultistepScheduler,
+    "DPM++SDE": DPMSolverMultistepScheduler,
+    "Euler": EulerDiscreteScheduler,
+    "Euler A": EulerAncestralDiscreteScheduler,
+    "PNDM": PNDMScheduler,
+    "DDIM": DDIMScheduler,
+    "SASolverScheduler": SASolverScheduler,
+    "UniPCMultistepScheduler": UniPCMultistepScheduler,
+    "HeunDiscreteScheduler": HeunDiscreteScheduler,
+    "DEISMultistepScheduler": DEISMultistepScheduler,
+    "LCMScheduler": LCMScheduler
+}
+available_schedulers = list(scheduler_mapping.keys())
+from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
+
+from accelerate import init_empty_weights
+from accelerate.utils import set_module_tensor_to_device
 
 import folder_paths
 
@@ -108,7 +144,7 @@ class DownloadAndLoadHy3DDelightModel:
             },
         }
 
-    RETURN_TYPES = ("DELIGHTMODEL",)
+    RETURN_TYPES = ("HY3DDIFFUSERSPIPE",)
     RETURN_NAMES = ("delight_pipe", )
     FUNCTION = "loadmodel"
     CATEGORY = "Hunyuan3DWrapper"
@@ -148,7 +184,7 @@ class Hy3DDelightImage:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "delight_pipe": ("DELIGHTMODEL",),
+                "delight_pipe": ("HY3DDIFFUSERSPIPE",),
                 "image": ("IMAGE", ),
                 "steps": ("INT", {"default": 50, "min": 1}),
                 "width": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 16}),
@@ -156,6 +192,9 @@ class Hy3DDelightImage:
                 "cfg_image": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 100.0, "step": 0.01}),
                 "cfg_text": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
+        },
+        "optional": {
+            "scheduler": ("NOISESCHEDULER",),
         }
     }
 
@@ -164,10 +203,18 @@ class Hy3DDelightImage:
     FUNCTION = "process"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def process(self, delight_pipe, image, width, height, cfg_image, cfg_text, steps, seed):
+    def process(self, delight_pipe, image, width, height, cfg_image, cfg_text, steps, seed, scheduler=None):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
+
+        if scheduler is not None:
+            if not hasattr(self, "default_scheduler"):
+                self.default_scheduler = delight_pipe.scheduler
+            delight_pipe.scheduler = scheduler
+        else:
+            if hasattr(self, "default_scheduler"):
+                delight_pipe.scheduler = self.default_scheduler
 
         image = image.permute(0, 3, 1, 2).to(device)
 
@@ -197,7 +244,7 @@ class DownloadAndLoadHy3DPaintModel:
             },
         }
 
-    RETURN_TYPES = ("HY3DPAINTMODEL",)
+    RETURN_TYPES = ("HY3DDIFFUSERSPIPE",)
     RETURN_NAMES = ("multiview_pipe", )
     FUNCTION = "loadmodel"
     CATEGORY = "Hunyuan3DWrapper"
@@ -219,15 +266,50 @@ class DownloadAndLoadHy3DPaintModel:
                 local_dir_use_symlinks=False,
             )
 
-        from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
-        custom_pipeline_path = os.path.join(script_directory, 'hy3dgen', 'texgen', 'hunyuanpaint')
+        torch_dtype = torch.float16
+        config_path = os.path.join(model_path, 'unet', 'config.json')
+        unet_ckpt_path_safetensors = os.path.join(model_path, 'unet','diffusion_pytorch_model.safetensors')
+        unet_ckpt_path_bin = os.path.join(model_path, 'unet','diffusion_pytorch_model.bin')
 
-        pipeline = DiffusionPipeline.from_pretrained(
-            model_path,
-            custom_pipeline=custom_pipeline_path, 
-            torch_dtype=torch.float16)
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config not found at {config_path}")
+        
 
-        pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config, timestep_spacing='trailing')
+        with open(config_path, 'r', encoding='utf-8') as file:
+            config = json.load(file)
+
+        with init_empty_weights():
+            unet = UNet2DConditionModel(**config)
+            unet = UNet2p5DConditionModel(unet)
+
+        # Try loading safetensors first, fall back to .bin
+        if os.path.exists(unet_ckpt_path_safetensors):
+            import safetensors.torch
+            unet_sd = safetensors.torch.load_file(unet_ckpt_path_safetensors)
+        elif os.path.exists(unet_ckpt_path_bin):
+            unet_sd = torch.load(unet_ckpt_path_bin, map_location='cpu', weights_only=True)
+        else:
+            raise FileNotFoundError(f"No checkpoint found at {unet_ckpt_path_safetensors} or {unet_ckpt_path_bin}")
+
+        #unet.load_state_dict(unet_ckpt, strict=True)
+        for name, param in unet.named_parameters():
+            set_module_tensor_to_device(unet, name, device=offload_device, dtype=torch_dtype, value=unet_sd[name])
+
+        vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae", device=device, torch_dtype=torch_dtype)
+        clip = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder", torch_dtype=torch_dtype)
+        tokenizer = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer")
+        scheduler = EulerAncestralDiscreteScheduler.from_pretrained(model_path, subfolder="scheduler")
+        feature_extractor = CLIPImageProcessor.from_pretrained(model_path, subfolder="feature_extractor")
+
+        pipeline = HunyuanPaintPipeline(
+            unet=unet,
+            vae = vae,
+            text_encoder=clip,
+            tokenizer=tokenizer,
+            scheduler=scheduler,
+            feature_extractor=feature_extractor,
+            )
+
         pipeline.enable_model_cpu_offload()
         return (pipeline,)
 
@@ -515,6 +597,56 @@ class Hy3DRenderMultiViewDepth:
             depth_maps.append(depth_map)
 
         return depth_maps
+
+class Hy3DDiffusersSchedulerConfig:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "pipeline": ("HY3DDIFFUSERSPIPE",),
+                "scheduler": (available_schedulers,
+                    {
+                        "default": 'Euler A'
+                    }),
+                "sigmas": (["default", "karras", "exponential", "beta"],),
+            },
+        }
+
+    RETURN_TYPES = ("NOISESCHEDULER",)
+    RETURN_NAMES = ("diffusers_scheduler",)
+    FUNCTION = "process"
+    CATEGORY = "Hunyuan3DWrapper"
+
+    def process(self, pipeline, scheduler, sigmas):
+
+        scheduler_config = dict(pipeline.scheduler.config)
+        
+        if scheduler in scheduler_mapping:
+            if scheduler == "DPM++SDE":
+                scheduler_config["algorithm_type"] = "sde-dpmsolver++"
+            else:
+                scheduler_config.pop("algorithm_type", None)
+            if sigmas == "default":
+                scheduler_config["use_karras_sigmas"] = False
+                scheduler_config["use_exponential_sigmas"] = False
+                scheduler_config["use_beta_sigmas"] = False
+            elif sigmas == "karras":
+                scheduler_config["use_karras_sigmas"] = True
+                scheduler_config["use_exponential_sigmas"] = False
+                scheduler_config["use_beta_sigmas"] = False
+            elif sigmas == "exponential":
+                scheduler_config["use_karras_sigmas"] = False
+                scheduler_config["use_exponential_sigmas"] = True
+                scheduler_config["use_beta_sigmas"] = False
+            elif sigmas == "beta":
+                scheduler_config["use_karras_sigmas"] = False
+                scheduler_config["use_exponential_sigmas"] = False
+                scheduler_config["use_beta_sigmas"] = True
+            noise_scheduler = scheduler_mapping[scheduler].from_config(scheduler_config)
+        else:
+            raise ValueError(f"Unknown scheduler: {scheduler}")
+        
+        return (noise_scheduler,)
     
 
 class Hy3DSampleMultiView:
@@ -522,7 +654,7 @@ class Hy3DSampleMultiView:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "pipeline": ("HY3DPAINTMODEL",),
+                "pipeline": ("HY3DDIFFUSERSPIPE",),
                 "ref_image": ("IMAGE", ),
                 "prompt": ("STRING", {"default": "", "multiline": False}),
                 "negative_prompt": ("STRING", {"default": "watermark, ugly, deformed, noisy, blurry, low contrast", "multiline": False}),
@@ -535,6 +667,7 @@ class Hy3DSampleMultiView:
             },
             "optional": {
                 "camera_config": ("HY3DCAMERA",),
+                "scheduler": ("NOISESCHEDULER",),
             }
         }
 
@@ -798,6 +931,7 @@ class Hy3DLoadMesh:
         
         return (mesh,)
 
+
 class Hy3DGenerateMesh:
     @classmethod
     def INPUT_TYPES(s):
@@ -934,6 +1068,53 @@ class Hy3DPostprocessMesh:
         
         return (new_mesh, )
     
+class Hy3DIMRemesh:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh": ("HY3DMESH",),
+                "merge_vertices": ("BOOLEAN", {"default": True}),
+                "vertex_count": ("INT", {"default": 10000, "min": 100, "max": 10000000, "step": 1}),
+                "smooth_iter": ("INT", {"default": 8, "min": 0, "max": 100, "step": 1}),
+                "align_to_boundaries": ("BOOLEAN", {"default": True}),
+                "triangulate_result": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("HY3DMESH",)
+    RETURN_NAMES = ("mesh",)
+    FUNCTION = "remesh"
+    CATEGORY = "Hunyuan3DWrapper"
+    DESCRIPTION = "Remeshes the mesh using instant-meshes: https://github.com/wjakob/instant-meshes, Note: this will remove all vertex colors and textures."
+
+    def remesh(self, mesh, merge_vertices, vertex_count, smooth_iter, align_to_boundaries, triangulate_result):
+        try:
+            import pynanoinstantmeshes as PyNIM
+        except ImportError:
+            raise ImportError("pynanoinstantmeshes not found. Please install it using 'pip install pynanoinstantmeshes'")
+        new_mesh = mesh.copy()
+        if merge_vertices:
+            mesh.merge_vertices(new_mesh)
+
+        new_verts, new_faces = PyNIM.remesh(
+            np.array(mesh.vertices, dtype=np.float32),
+            np.array(mesh.faces, dtype=np.uint32),
+            vertex_count,
+            align_to_boundaries=align_to_boundaries,
+            smooth_iter=smooth_iter
+        )
+        if new_verts.shape[0] - 1 != new_faces.max():
+            # Skip test as the meshing failed
+            raise ValueError("Instant-meshes failed to remesh the mesh")
+        new_verts = new_verts.astype(np.float32)
+        if triangulate_result:
+            new_faces = trimesh.geometry.triangulate_quads(new_faces)
+
+        new_mesh = trimesh.Trimesh(new_verts, new_faces)
+        
+        return (new_mesh, )
+    
 class Hy3DGetMeshPBRTextures:
     @classmethod
     def INPUT_TYPES(s):
@@ -1064,6 +1245,37 @@ class Hy3DExportMesh:
         relative_path = Path(subfolder) / f'{filename}_{counter:05}_.glb'
         
         return (str(relative_path), )
+    
+class Hy3DModelStats:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh": ("HY3DMESH",),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("model_stats",)
+    FUNCTION = "process"
+    CATEGORY = "Hunyuan3DWrapper"
+
+    def process(self, mesh):
+        vertex_count = len(mesh.vertices)
+        face_count = len(mesh.faces)
+        bounding_box = mesh.bounding_box.extents
+        volume = mesh.volume
+        surface_area = mesh.area
+
+        stats = (
+            f"Vertex Count: {vertex_count}\n"
+            f"Face Count: {face_count}\n"
+            f"Bounding Box Dimensions: {bounding_box}\n"
+            f"Volume: {volume}\n"
+            f"Surface Area: {surface_area}\n"
+        )
+
+        return (stats,)
 
 NODE_CLASS_MAPPINGS = {
     "Hy3DModelLoader": Hy3DModelLoader,
@@ -1088,8 +1300,11 @@ NODE_CLASS_MAPPINGS = {
     "Hy3DSetMeshPBRTextures": Hy3DSetMeshPBRTextures,
     "Hy3DSetMeshPBRAttributes": Hy3DSetMeshPBRAttributes,
     "Hy3DVAEDecode": Hy3DVAEDecode,
-    "Hy3DRenderSingleView": Hy3DRenderSingleView
-    }
+    "Hy3DRenderSingleView": Hy3DRenderSingleView,
+    "Hy3DDiffusersSchedulerConfig": Hy3DDiffusersSchedulerConfig,
+    "Hy3DIMRemesh": Hy3DIMRemesh,
+    "Hy3DModelStats": Hy3DModelStats
+}
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DModelLoader": "Hy3DModelLoader",
     "Hy3DGenerateMesh": "Hy3DGenerateMesh",
@@ -1113,5 +1328,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DSetMeshPBRTextures": "Hy3D Set Mesh PBR Textures",
     "Hy3DSetMeshPBRAttributes": "Hy3D Set Mesh PBR Attributes",
     "Hy3DVAEDecode": "Hy3D VAE Decode",
-    "Hy3DRenderSingleView": "Hy3D Render SingleView"
-    }
+    "Hy3DRenderSingleView": "Hy3D Render SingleView",
+    "Hy3DDiffusersSchedulerConfig": "Hy3D Diffusers Scheduler Config",
+    "Hy3DIMRemesh": "Hy3D Instant-Meshes Remesh",
+    "Hy3DModelStats": "Hy3D Model Stats"
+}

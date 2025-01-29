@@ -182,11 +182,14 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
 
         cached_condition['ref_latents'] = ref_latents
 
+        print("Running HunyuanPaintPipeline")
+
         if guidance_scale > 1:
             negative_ref_latents = torch.zeros_like(cached_condition['ref_latents'])
             cached_condition['ref_latents'] = torch.cat([negative_ref_latents, cached_condition['ref_latents']])
             cached_condition['ref_scale'] = torch.as_tensor([0.0, 1.0]).to(cached_condition['ref_latents'])
             if "normal_imgs" in cached_condition:
+                print("normal_imgs: ", cached_condition['normal_imgs'].shape)
                 cached_condition['normal_imgs'] = torch.cat(
                     (cached_condition['normal_imgs'], cached_condition['normal_imgs']))
 
